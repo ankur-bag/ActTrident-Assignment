@@ -52,42 +52,31 @@ flowchart LR
 
 ## Request Processing Flow
 
-The gateway intentionally completes screening **before** contacting the upstream provider.
+The gateway screens every request **before** contacting the upstream provider.
 
 ```mermaid
-sequenceDiagram
-    participant C as Client
-    participant G as Prompt Gate
-    participant U as Upstream
+flowchart TD
+    A[Client Request<br/>POST /v1/messages] --> B[Read & Parse JSON]
+    B --> C[Extract User Content]
+    C --> D[Run Security Screening]
 
-    C->>G: POST /v1/messages
-    G->>G: Read complete request body
-    G->>G: Parse JSON
-    G->>G: Extract user content
-    G->>G: Run security screening
+    D --> E{Request blocked?}
 
-    alt Request is blocked
-        G-->>C: HTTP 403
-    else Request is allowed
-        G->>U: Forward request
+    E -- Yes --> F[403 Request Blocked]
+    E -- No --> G[Forward to Upstream]
 
-        alt stream = false
-            U-->>G: Complete response
-            G-->>C: Complete response
-        else stream = true
-            U-->>G: chunk0
-            G-->>C: chunk0
-            U-->>G: chunk1
-            G-->>C: chunk1
-            U-->>G: chunk2
-            G-->>C: chunk2
-            U-->>G: ...
-        end
-    end
+    G --> H{stream = true?}
+
+    H -- No --> I[Read Complete Response]
+    H -- Yes --> J[Pipe Upstream Body]
+
+    J --> K[Forward SSE Chunks<br/>as They Arrive]
+
+    I --> L[Return Response to Client]
+    K --> L
 ```
 
-The incoming request is **not** streamed blindly to the upstream service. The full request is first available to the screening layer.
-
+The complete incoming request is parsed and screened before any upstream request is made. Blocked requests return 403. Allowed requests are forwarded normally; when "stream": true, the upstream response body is piped to the client incrementally instead of being buffered.
 ---
 
 # Main Change
