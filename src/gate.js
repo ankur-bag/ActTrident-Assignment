@@ -11,6 +11,8 @@
 
 const http = require('node:http');
 const crypto = require('node:crypto');
+const { Readable } = require('node:stream');
+const { pipeline } = require('node:stream/promises');
 
 const PORT = Number(process.env.GATE_PORT || 7100);
 const UPSTREAM = process.env.UPSTREAM_URL || 'http://127.0.0.1:7101';
@@ -28,7 +30,7 @@ const CONFIG = {
 
 function conf(name) {
   const spec = CONFIG[name];
-  return process.env[spec.env];
+  return process.env[spec.env] ?? spec.default;
 }
 
 function screeningEnabled() {
@@ -88,15 +90,13 @@ function sendJson(res, status, obj) {
   res.end(body);
 }
 
-async function forward(path, headers, body) {
+async function forward(path, headers, body, signal) {
   const out = {};
   for (const [k, v] of Object.entries(headers)) {
     if (['host', 'connection', 'content-length'].includes(k.toLowerCase())) continue;
     out[k] = v;
   }
-  const resp = await fetch(`${UPSTREAM}${path}`, { method: 'POST', headers: out, body });
-  const text = await resp.text();
-  return { status: resp.status, text, headers: resp.headers };
+  return fetch(`${UPSTREAM}${path}`, { method: 'POST', headers: out, body, signal });
 }
 
 const server = http.createServer(async (req, res) => {
@@ -124,21 +124,38 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
-  let upstream;
+  const controller = new AbortController();
+  const onClose = () => controller.abort();
+  res.once('close', onClose);
   try {
-    upstream = await forward(req.url, req.headers, raw);
+    const upstream = await forward(req.url, req.headers, raw, controller.signal);
+    const streaming = body?.stream === true;
+    const text = streaming ? null : await upstream.text();
+    const headers = { 'x-gate-request-id': requestId };
+    if (findings.length > 0) headers['x-gate-warning'] = findings.join('; ');
+    // Fetch decompresses the body; Node supplies framing for the outgoing response.
+    const excluded = new Set([
+      'content-length', 'content-encoding', 'transfer-encoding', 'connection',
+      'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'upgrade',
+      ...(upstream.headers.get('connection') || '').toLowerCase().split(',').map((h) => h.trim()),
+    ]);
+    for (const [k, v] of upstream.headers.entries()) {
+      if (!excluded.has(k.toLowerCase())) headers[k] = v;
+    }
+    res.writeHead(upstream.status, headers);
+    if (streaming && upstream.body) {
+      res.flushHeaders();
+      await pipeline(Readable.fromWeb(upstream.body), res);
+    } else {
+      res.end(text);
+    }
   } catch (err) {
+    if (res.destroyed) return;
+    if (res.headersSent) return res.destroy(err);
     return sendJson(res, 502, { error: 'upstream_unreachable', detail: String(err.message || err) });
+  } finally {
+    res.off('close', onClose);
   }
-
-  const headers = { 'x-gate-request-id': requestId };
-  if (findings.length > 0) headers['x-gate-warning'] = findings.join('; ');
-  for (const [k, v] of upstream.headers.entries()) {
-    if (['content-length', 'transfer-encoding', 'connection'].includes(k.toLowerCase())) continue;
-    headers[k] = v;
-  }
-  res.writeHead(upstream.status, headers);
-  res.end(upstream.text);
 });
 
 server.listen(PORT, '127.0.0.1', () => {
