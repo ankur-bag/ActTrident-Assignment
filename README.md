@@ -1,139 +1,78 @@
-# Prompt Gate — Streaming Proxy Assignment
+# Prompt Gate
 
-A small Node.js reverse proxy that screens model-style requests before forwarding them to an upstream provider.
+A lightweight Node.js reverse proxy that screens model-style API requests before forwarding them to an upstream provider.
 
-This implementation adds **true HTTP response streaming** for requests with `"stream": true` while preserving the existing screening flow and non-streaming behavior.
-
----
-
-## Overview
-
-The gateway sits between a client and an upstream model provider.
-
-Its responsibilities are:
-
-- Accept JSON model-style requests.
-- Extract user-authored content.
-- Screen prompts for suspicious or unsafe patterns.
-- Block matching requests when running in `block` mode.
-- Forward safe requests to the upstream service.
-- Preserve normal buffered responses.
-- Stream upstream SSE responses incrementally when `"stream": true`.
-- Propagate relevant upstream status codes and headers.
-- Cancel upstream work when the client disconnects.
+This implementation adds **true HTTP/SSE response streaming** for requests with `"stream": true` while preserving the existing screening and normal response behavior.
 
 ---
 
-## Architecture
+## What Changed
 
-```mermaid
-flowchart LR
-    A[Client] -->|POST /v1/messages| B[Prompt Gate]
-    B --> C{Parse JSON}
-    C --> D[Extract user text]
-    D --> E[Security Screening]
+The gateway now:
 
-    E -->|Finding + block mode| F[403 Request Blocked]
-    E -->|Safe / warn mode| G[Forward to Upstream]
+- streams upstream SSE responses incrementally when `"stream": true`
+- keeps normal requests on the existing buffered-response path
+- screens requests **before** forwarding them upstream
+- restores the intended default screening configuration
+- preserves relevant upstream status and headers
+- removes stale encoding/length and hop-by-hop headers
+- cancels upstream work when the client disconnects
+- returns `502` when the upstream fails before a response begins
 
-    G --> H{stream == true?}
-
-    H -->|No| I[Buffered Response]
-    I --> J[Client]
-
-    H -->|Yes| K[Read Upstream Stream]
-    K --> L[Forward Each Chunk]
-    L --> J
-
-    M[Upstream Provider] --> G
-```
+No additional framework or runtime dependency was added.
 
 ---
 
-## Request Processing Flow
-
-The gateway screens every request **before** contacting the upstream provider.
+## Request Flow
 
 ```mermaid
 flowchart TD
-    A[Client Request<br/>POST /v1/messages] --> B[Read & Parse JSON]
-    B --> C[Extract User Content]
-    C --> D[Run Security Screening]
+    A["Client Request"] --> B["Parse JSON"]
+    B --> C["Security Screening"]
+    C --> D{"Blocked?"}
 
-    D --> E{Request blocked?}
+    D -- Yes --> E["403 Request Blocked"]
+    D -- No --> F["Forward to Upstream"]
 
-    E -- Yes --> F[403 Request Blocked]
-    E -- No --> G[Forward to Upstream]
+    F --> G{"stream: true?"}
 
-    G --> H{stream = true?}
+    G -- No --> H["Buffered Response"]
+    G -- Yes --> I["Stream Upstream Body"]
 
-    H -- No --> I[Read Complete Response]
-    H -- Yes --> J[Pipe Upstream Body]
-
-    J --> K[Forward SSE Chunks<br/>as They Arrive]
-
-    I --> L[Return Response to Client]
-    K --> L
+    H --> J["Client"]
+    I --> J
 ```
 
-The complete incoming request is parsed and screened before any upstream request is made. Blocked requests return 403. Allowed requests are forwarded normally; when "stream": true, the upstream response body is piped to the client incrementally instead of being buffered.
+The complete incoming request is parsed and screened before any upstream request is made.
+
+For normal requests:
+
+```text
+Client → Gate → Upstream → Complete Response → Client
+```
+
+For streaming requests:
+
+```text
+Upstream chunk0 → Gate → Client
+Upstream chunk1 → Gate → Client
+Upstream chunk2 → Gate → Client
+...
+```
+
 ---
 
-# Main Change
+## Streaming
 
-The original implementation consumed the complete upstream response using behavior equivalent to:
+The original gateway consumed the complete upstream response using:
 
 ```js
-const text = await upstream.text();
+await upstream.text();
 ```
 
-That is appropriate for ordinary responses, but it buffers streamed responses.
+That works for ordinary JSON responses, but it buffers SSE responses.
 
-For an upstream SSE response such as:
-
-```text
-chunk0
-chunk1
-chunk2
-chunk3
-chunk4
-```
-
-the previous behavior effectively became:
-
-```text
-Upstream
-   │
-   ├─ chunk0
-   ├─ chunk1
-   ├─ chunk2
-   ├─ chunk3
-   └─ chunk4
-         │
-         ▼
-   Wait for everything
-         │
-         ▼
-       Client
-```
-
-The updated streaming path behaves as:
-
-```text
-Upstream chunk0 ──→ Gate ──→ Client
-Upstream chunk1 ──→ Gate ──→ Client
-Upstream chunk2 ──→ Gate ──→ Client
-Upstream chunk3 ──→ Gate ──→ Client
-Upstream chunk4 ──→ Gate ──→ Client
-```
-
-The implementation uses Node.js streams and `pipeline()` so backpressure is handled by the standard stream implementation.
-
----
-
-# Streaming Decision
-
-Streaming is enabled when the incoming JSON contains:
+For requests containing:
 
 ```json
 {
@@ -141,40 +80,23 @@ Streaming is enabled when the incoming JSON contains:
 }
 ```
 
-Conceptually:
+the gateway now forwards `upstream.body` through Node's stream pipeline so chunks reach the client as they arrive.
 
-```js
-if (body.stream === true) {
-  // Forward upstream.body progressively
-} else {
-  // Preserve normal buffered behavior
-}
-```
-
-This assignment implements **backend HTTP response streaming**.
-
-It does not require a frontend or UI.
+The streaming path uses `pipeline()`, which also provides standard Node.js backpressure handling.
 
 ---
 
-# Security Screening
+## Screening
 
-The gate inspects user-authored content before forwarding the request.
+User-authored content is screened before the request is forwarded upstream.
 
-Examples of currently detected content include:
-
-- Requests to ignore previous instructions.
-- References to credential material.
-- Download-and-execute shell commands.
-- Attempts to reveal or print the model's system prompt.
-
-A matching request in `block` mode returns:
+In `block` mode, suspicious requests return:
 
 ```text
 HTTP 403 Forbidden
 ```
 
-Example response:
+Example:
 
 ```json
 {
@@ -189,20 +111,16 @@ Example response:
 
 ---
 
-# Configuration
-
-The gateway supports environment-based configuration.
+## Configuration
 
 | Variable | Default | Purpose |
-|---|---:|---|
-| `GATE_PORT` | `7100` | Gateway HTTP port |
+|---|---|---|
+| `GATE_PORT` | `7100` | Gateway port |
 | `UPSTREAM_URL` | `http://127.0.0.1:7101` | Upstream provider |
-| `GATE_SCREENING` | `1` | Enables screening |
+| `GATE_SCREENING` | `1` | Enable screening |
 | `GATE_MODE` | `block` | `block` or `warn` |
 
 The configuration fallback now correctly applies declared defaults when environment variables are unset.
-
-For example:
 
 ```js
 function conf(name) {
@@ -211,29 +129,13 @@ function conf(name) {
 }
 ```
 
-Therefore:
-
-```text
-GATE_SCREENING unset
-        ↓
-default = "1"
-        ↓
-screening enabled
-```
-
-An operator can explicitly disable screening with:
-
-```powershell
-$env:GATE_SCREENING="0"
-```
-
 ---
 
-# Response Header Handling
+## Response Handling
 
-The gateway preserves useful upstream response metadata while avoiding stale or hop-by-hop headers.
+Useful upstream response metadata is preserved, while stale or hop-by-hop headers are excluded.
 
-Examples of excluded headers include:
+Examples include:
 
 ```text
 content-length
@@ -241,132 +143,47 @@ content-encoding
 transfer-encoding
 connection
 keep-alive
-proxy-authenticate
-proxy-authorization
-te
-trailer
-upgrade
 ```
 
-This is important because Node's `fetch()` may already decompress the response body.
+This is especially important because Node's `fetch()` may transparently decompress an upstream response.
 
-Forwarding an original header such as:
-
-```text
-Content-Encoding: gzip
-```
-
-after the body has already been decompressed would cause clients to attempt decompression again.
-
-Relevant headers such as the upstream status and content type are preserved.
-
-For SSE responses this includes:
+For SSE responses, the upstream content type is preserved:
 
 ```text
 Content-Type: text/event-stream
 ```
 
----
-
-# Error and Disconnect Handling
-
-An `AbortController` is associated with the upstream request.
-
-If the client disconnects:
-
-```text
-Client disconnect
-      ↓
-AbortController
-      ↓
-Upstream request cancelled
-```
-
-Failures before response headers are sent return:
-
-```text
-HTTP 502
-```
-
-with an `upstream_unreachable` response.
-
-If a failure occurs after streaming has already started, the connection is terminated because the HTTP response has already been committed.
+Client disconnects also abort the associated upstream request.
 
 ---
 
-# Project Structure
+## Project Structure
 
 ```text
 acttrident-assignment/
-│
 ├── src/
 │   ├── gate.js
 │   ├── upstream.js
 │   └── bench.js
-│
 ├── test/
 │   └── gate.test.js
-│
 ├── NOTES.md
 └── README.md
 ```
 
-### `src/gate.js`
-
-The reverse proxy and screening gateway.
-
-This is the main implementation file.
-
-### `src/upstream.js`
-
-A local fake model provider used to simulate:
-
-- normal model responses
-- SSE streaming behavior
-- upstream response behavior
-
-This file was left unchanged.
-
-### `src/bench.js`
-
-A small benchmark utility that sends concurrent requests to the gateway.
-
-### `test/gate.test.js`
-
-Integration tests for gateway behavior, including streaming.
+`src/upstream.js` remains unchanged.
 
 ---
 
-# Requirements
+## Run
 
-The implementation was verified with:
+Requires Node.js. Verified locally with:
 
 ```text
 Node.js v24.14.1
 ```
 
-No additional framework is required.
-
-The project uses Node's built-in APIs, including:
-
-```text
-node:http
-node:crypto
-node:stream
-node:stream/promises
-fetch
-AbortController
-```
-
----
-
-# Running the Project
-
-Open two terminals.
-
-## 1. Start the upstream provider
-
-From the repository root:
+### 1. Start the upstream provider
 
 ```powershell
 node src/upstream.js
@@ -378,9 +195,7 @@ Expected:
 upstream on :7101
 ```
 
----
-
-## 2. Start the gateway
+### 2. Start the gateway
 
 In another terminal:
 
@@ -396,33 +211,21 @@ gate on :7100 -> http://127.0.0.1:7101  screening=true mode=block
 
 ---
 
-# Manual Verification
+## Verification
 
-Because PowerShell may alter embedded JSON quotes passed directly to `curl.exe`, piping JSON through stdin is the most reliable approach.
-
----
-
-## Health Check
+### Health
 
 ```powershell
 curl.exe -s http://127.0.0.1:7100/healthz
 ```
 
-Verified response:
+Expected:
 
 ```json
-{
-  "ok": true,
-  "screening": true,
-  "mode": "block"
-}
+{"ok":true,"screening":true,"mode":"block"}
 ```
 
----
-
-# Normal Request
-
-Create the request:
+### Normal Request
 
 ```powershell
 $body = @{
@@ -436,38 +239,13 @@ $body = @{
 } | ConvertTo-Json -Depth 5 -Compress
 ```
 
-Send it:
-
 ```powershell
 $body | curl.exe -s -X POST http://127.0.0.1:7100/v1/messages `
   -H "content-type: application/json" `
   --data-binary "@-"
 ```
 
-Verified response:
-
-```json
-{
-  "id": "resp_1",
-  "model": "demo-model",
-  "content": [
-    {
-      "type": "text",
-      "text": "ok"
-    }
-  ],
-  "usage": {
-    "input_tokens": 180,
-    "output_tokens": 42
-  }
-}
-```
-
----
-
-# Blocked Request
-
-Create a request that should trigger screening:
+### Blocked Request
 
 ```powershell
 $badBody = @{
@@ -481,32 +259,19 @@ $badBody = @{
 } | ConvertTo-Json -Depth 5 -Compress
 ```
 
-Send it:
-
 ```powershell
 $badBody | curl.exe -i -X POST http://127.0.0.1:7100/v1/messages `
   -H "content-type: application/json" `
   --data-binary "@-"
 ```
 
-Verified result:
+Expected:
 
 ```text
 HTTP/1.1 403 Forbidden
 ```
 
-with findings including:
-
-```text
-asks the model to ignore earlier instructions
-names credential material
-```
-
----
-
-# Streaming Request
-
-Create a streaming request:
+### Streaming Request
 
 ```powershell
 $streamBody = @{
@@ -521,15 +286,13 @@ $streamBody = @{
 } | ConvertTo-Json -Depth 5 -Compress
 ```
 
-Send it using curl's no-buffer option:
-
 ```powershell
 $streamBody | curl.exe -N -X POST http://127.0.0.1:7100/v1/messages `
   -H "content-type: application/json" `
   --data-binary "@-"
 ```
 
-Expected streamed output:
+Expected progressive output:
 
 ```text
 event: delta
@@ -551,239 +314,64 @@ event: done
 data: {}
 ```
 
-The important property is that the chunks are delivered progressively rather than being collected and emitted together at the end.
-
 ---
 
-# Automated Tests
-
-Run:
+## Automated Test
 
 ```powershell
 node --test test/gate.test.js
 ```
 
-Verified test output included:
+Verified result:
 
 ```text
 SSE first=137 ms, finished=632 ms
-```
 
-and:
-
-```text
 tests 1
 pass 1
 fail 0
 ```
 
-This provides objective confirmation that the client received SSE data substantially before the full upstream response had completed.
-
-```mermaid
-gantt
-    title Verified SSE Timing
-    dateFormat X
-    axisFormat %L ms
-
-    section Stream
-    First SSE data     :milestone, first, 137, 0
-    Stream completion  :milestone, done, 632, 0
-```
-
-The first data was observed around:
-
-```text
-137 ms
-```
-
-while stream completion occurred around:
-
-```text
-632 ms
-```
-
-Therefore, the gateway is forwarding data progressively rather than buffering the full response.
+The first SSE data reached the client well before the complete stream finished, confirming that the gateway is forwarding data incrementally.
 
 ---
 
-# Benchmark
+## Benchmark
 
-Benchmark command:
+Run:
 
 ```powershell
 node src/bench.js --requests 60 --concurrency 8
 ```
 
-Three verified post-change runs:
+Verified post-change runs:
 
-### Run 1
+| Run | Wall Clock | Throughput |
+|---:|---:|---:|
+| 1 | 454 ms | 132.2 req/s |
+| 2 | 430 ms | 139.5 req/s |
+| 3 | 420 ms | 142.9 req/s |
 
-```text
-requests     60  (60 ok)
-concurrency  8
-wall clock   454 ms
-avg latency  7.6 ms
-throughput   132.2 req/s
-```
+**Median throughput: 139.5 req/s**
 
-### Run 2
+All three runs completed with `60/60` successful requests.
 
-```text
-requests     60  (60 ok)
-concurrency  8
-wall clock   430 ms
-avg latency  7.2 ms
-throughput   139.5 req/s
-```
-
-### Run 3
-
-```text
-requests     60  (60 ok)
-concurrency  8
-wall clock   420 ms
-avg latency  7.0 ms
-throughput   142.9 req/s
-```
-
-Median throughput:
-
-```text
-139.5 req/s
-```
-
-All three runs completed with:
-
-```text
-60 / 60 successful requests
-```
+The benchmark exercises the non-streaming path. Detailed before/after measurements are available in [`NOTES.md`](./NOTES.md).
 
 ---
 
-# Benchmark Note
+## Scope
 
-The supplied benchmark reports:
+The implementation intentionally does not introduce:
 
-```text
-avg latency = total wall clock / request count
-```
-
-while requests are running concurrently.
-
-Therefore, the displayed value is not the true arithmetic mean of individual per-request latency.
-
-For this reason, the most useful values for comparison are:
-
-- total wall-clock duration
-- throughput
-- successful request count
-
-The benchmark also exercises the non-streaming path, so it should not be interpreted as a streaming-throughput benchmark.
-
----
-
-# Verified Behavior
-
-The following behaviors were manually or automatically verified:
-
-```text
-[✓] Gateway starts successfully
-[✓] Screening enabled by default
-[✓] Health endpoint returns 200
-[✓] Safe request returns 200
-[✓] Dangerous request returns 403
-[✓] Screening occurs before upstream forwarding
-[✓] Normal response path still works
-[✓] stream=true forwards SSE incrementally
-[✓] First SSE data arrives before stream completion
-[✓] Upstream response status and useful headers are retained
-[✓] Gzip/header handling avoids double decompression
-[✓] Client disconnect can cancel upstream work
-[✓] Automated integration test passes
-[✓] Benchmark completes with all requests successful
-[✓] src/upstream.js remains unchanged
-```
-
----
-
-# Scope Decisions
-
-The implementation intentionally keeps the change focused.
-
-It does **not** introduce:
-
-- Express
-- additional npm dependencies
+- a new framework
+- additional dependencies
 - frontend/UI code
-- a new screening engine
-- major architecture changes
+- new screening rules
 - benchmark redesign
-- modifications to `src/upstream.js`
+- changes to `src/upstream.js`
 
-The goal is to solve the requested streaming behavior with minimal impact on the existing service.
-
----
-
-# Known Limitations
-
-The existing gateway reads the entire incoming request into memory before screening.
-
-There is currently no explicit:
-
-```text
-request body size limit
-request read timeout
-```
-
-These would be useful production hardening measures, but they are outside the scope of this streaming change.
-
-Slow-client streaming throughput was also not separately load-tested.
-
----
-
-# Summary
-
-The core problem was:
-
-```text
-Upstream streams
-       ↓
-Gateway buffers entire response
-       ↓
-Client receives everything at the end
-```
-
-The updated behavior is:
-
-```text
-Upstream chunk
-       ↓
-Gateway
-       ↓
-Client
-
-Upstream next chunk
-       ↓
-Gateway
-       ↓
-Client
-```
-
-while preserving the required security order:
-
-```text
-Request
-   ↓
-Parse
-   ↓
-Screen
-   ↓
-Block or Forward
-   ↓
-Normal response / Streamed response
-```
-
-The result is a small reverse proxy that retains prompt screening while correctly supporting progressive HTTP/SSE responses.
+The existing gateway still reads the complete incoming request into memory before screening. Explicit request-size limits and read timeouts would be useful production hardening, but are outside the scope of this task.
 
 ---
 
@@ -791,4 +379,4 @@ The result is a small reverse proxy that retains prompt screening while correctl
 
 AI assistance was used during repository inspection and development.
 
-Submitted code, test results, and benchmark measurements should be reviewed and verified locally by the applicant before final submission.
+All submitted code changes, tests, and benchmark measurements were reviewed and verified locally before submission.
