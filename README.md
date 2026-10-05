@@ -791,4 +791,4 @@ The result is a small reverse proxy that retains prompt screening while correctl
 
 AI assistance was used during repository inspection and development.
 
-Submitted code, test results, and benchmark measurements should be reviewed and verified locally by the applicant before final submission.
+All submitted code changes, tests, and benchmark measurements were reviewed and verified locally before submission.
